@@ -1,0 +1,206 @@
+"""
+BLENDER SUNUCU - Timer tabanlı, güvenli versiyon
+=================================================
+Blender Text Editor'da çalıştır.
+
+ÖNEMLI: CAMERA_NAME değişkenini kendi kameranın adıyla değiştir.
+Kameranın adını Blender'da objeye tıklayarak Properties panelinden görebilirsin.
+
+Çalışma mantığı:
+  - Socket server arka plan thread'inde istekleri alır
+  - render() gibi Blender API çağrıları bir KUYRUĞA eklenir
+  - bpy.app.timers her 0.1s ana thread'de kuyruğu boşaltır
+  - Böylece Blender çökmez
+"""
+
+import bpy
+import socket
+import threading
+import base64
+import os
+import json
+import queue
+import time
+
+# ─────────────────────────────────────────
+# AYARLAR — kendi kameranın adını yaz
+# ─────────────────────────────────────────
+HOST        = "127.0.0.1"
+PORT        = 9999
+RENDER_PATH = "/tmp/blender_frame.png"
+CAMERA_NAME = "Camera"   # ← Blender'daki kameranın tam adı
+
+# ─────────────────────────────────────────
+# GLOBAL KUYRUK
+# ─────────────────────────────────────────
+task_queue   = queue.Queue()
+result_store = {}
+result_lock  = threading.Lock()
+task_counter = [0]
+
+def next_task_id():
+    task_counter[0] += 1
+    return task_counter[0]
+
+
+# ─────────────────────────────────────────
+# BLENDER İŞLEMLERİ (ana thread'de çalışır)
+# ─────────────────────────────────────────
+
+def do_render():
+    scene = bpy.context.scene
+    scene.render.filepath = RENDER_PATH
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.resolution_x = 640
+    scene.render.resolution_y = 480
+    bpy.ops.render.render(write_still=True)
+    print("[Blender] ✅ Render tamamlandı")
+
+
+def do_move_camera(x, y, z):
+    cam = bpy.data.objects.get(CAMERA_NAME)
+    if cam:
+        cam.location.x = float(x)
+        cam.location.y = float(y)
+        cam.location.z = float(z)
+        print(f"[Blender] 📍 Kamera → ({x:.2f}, {y:.2f}, {z:.2f})")
+        return "OK"
+    print(f"[Blender] ❌ '{CAMERA_NAME}' bulunamadı!")
+    return f"ERROR:camera_not_found"
+
+
+def do_get_position():
+    cam = bpy.data.objects.get(CAMERA_NAME)
+    if cam:
+        loc = cam.location
+        return json.dumps({"x": round(loc.x,4), "y": round(loc.y,4), "z": round(loc.z,4)})
+    return json.dumps({"error": "camera_not_found"})
+
+
+def do_get_image_b64():
+    if not os.path.exists(RENDER_PATH):
+        return None
+    with open(RENDER_PATH, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+# ─────────────────────────────────────────
+# TIMER (ana thread - 100ms)
+# ─────────────────────────────────────────
+
+def process_task_queue():
+    try:
+        while not task_queue.empty():
+            task_id, cmd, args = task_queue.get_nowait()
+            result = "ERROR:unknown_cmd"
+
+            if cmd == "PING":
+                result = "PONG"
+
+            elif cmd == "RENDER_AND_GET":
+                do_render()
+                b64 = do_get_image_b64()
+                result = f"IMAGE:{b64}" if b64 else "ERROR:no_render_file"
+
+            elif cmd == "GET_POSITION":
+                result = f"POSITION:{do_get_position()}"
+
+            elif cmd == "MOVE":
+                x, y, z = args
+                result = do_move_camera(x, y, z)
+
+            with result_lock:
+                result_store[task_id] = result
+
+    except Exception as e:
+        print(f"[Blender Timer] Hata: {e}")
+
+    return 0.1
+
+
+# ─────────────────────────────────────────
+# SOCKET SERVER (arka plan thread)
+# ─────────────────────────────────────────
+
+def wait_for_result(task_id, timeout=120.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        with result_lock:
+            if task_id in result_store:
+                return result_store.pop(task_id)
+        time.sleep(0.05)
+    return "ERROR:timeout"
+
+
+def handle_client(conn, addr):
+    try:
+        raw = conn.recv(4096).decode("utf-8").strip()
+        if not raw:
+            return
+        print(f"[Blender] ← {raw[:80]}")
+
+        tid = next_task_id()
+
+        if raw == "PING":
+            task_queue.put((tid, "PING", None))
+
+        elif raw == "GET_IMAGE":
+            task_queue.put((tid, "RENDER_AND_GET", None))
+
+        elif raw == "GET_POSITION":
+            task_queue.put((tid, "GET_POSITION", None))
+
+        elif raw.startswith("MOVE_DRONE:"):
+            parts = raw[len("MOVE_DRONE:"):].split(",")
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            task_queue.put((tid, "MOVE", (x, y, z)))
+
+        else:
+            conn.sendall(b"UNKNOWN_COMMAND\n")
+            return
+
+        result = wait_for_result(tid)
+        conn.sendall(f"{result}\n".encode("utf-8"))
+
+    except Exception as e:
+        print(f"[Blender] handle_client hata: {e}")
+        try:
+            conn.sendall(f"ERROR:{e}\n".encode("utf-8"))
+        except:
+            pass
+    finally:
+        conn.close()
+
+
+def socket_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((HOST, PORT))
+    except OSError as e:
+        print(f"[Blender] ❌ Port {PORT} kullanımda: {e}")
+        return
+    srv.listen(20)
+    print(f"[Blender] 🟢 Server açık → {HOST}:{PORT}")
+    while True:
+        try:
+            conn, addr = srv.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        except Exception as e:
+            print(f"[Blender] accept hatası: {e}")
+
+
+# ─────────────────────────────────────────
+# BAŞLAT
+# ─────────────────────────────────────────
+
+if not bpy.app.timers.is_registered(process_task_queue):
+    bpy.app.timers.register(process_task_queue, persistent=True)
+
+threading.Thread(target=socket_server, daemon=True).start()
+
+print("=" * 50)
+print("  BLENDER SERVER HAZIR")
+print(f"  Kamera: {CAMERA_NAME}")
+print(f"  Port  : {PORT}")
+print("=" * 50)
