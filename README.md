@@ -9,4 +9,5 @@
 
 Kırmızı kare yakalama opencv ile
 
-<img width="854" height="480" alt="2026-06-26 13-28-30 (online-video-cutter com)(1)" src="https://github.com/user-attachments/assets/a4322111-2292-41f8-9186-e8a18b2a388f" />
+<img width="854" height="480" alt="2026-06-26 13-28-30 (online-video-cutter com)(3)" src="https://github.com/user-attachments/assets/10a84236-032b-4dcf-87d4-5c5f163db69f" />
+
