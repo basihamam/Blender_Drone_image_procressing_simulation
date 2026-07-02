@@ -28,5 +28,5 @@ harita görüntüsü alma çeşitli fonksiyonlarla çalışıyor elinizde Camera
 
 
 <img width="854" height="480" alt="2026-07-02 13-23-38 (online-video-cutter com)" src="https://github.com/user-attachments/assets/59005585-9ebc-4907-aa1c-155795582c34" />
-
+# DİKKAT kullanım hala son kullanıcılar için uygun değil drone başlatmak için tuşları kullanıyonuz haritayı açmak ve manuel waypoint ayarlamak için p tuşu , m tuşu ilede default bir şekilde spiral mi dönücek yoksa sizin manuel way pointtemi uçacak onu ayarlıyorsunuz, başlatmak için g tuşuna durdurmak için s tuşuna basmalısınız, bu arada manuel oluşturduğunuz yolda görüntü tanımlama çalışmıyor ve çalışması için koyduğum tuşu unuttum düzeltebilirim veya bu sorunları v0.3 de halledebilirim 
 
