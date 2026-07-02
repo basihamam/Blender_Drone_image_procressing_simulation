@@ -1,0 +1,347 @@
+"""
+BLENDER SUNUCU - Timer tabanlı, güvenli versiyon
+=================================================
+Blender Text Editor'da çalıştır.
+
+ÖNEMLI: CAMERA_NAME ve CAMERA_MAP_NAME değişkenlerini kendi objelerinin
+adıyla değiştir. Obje adını Blender'da objeye tıklayarak Properties
+panelinden görebilirsin.
+
+Çalışma mantığı:
+  - Socket server arka plan thread'inde istekleri alır
+  - render() gibi Blender API çağrıları bir KUYRUĞA eklenir
+  - bpy.app.timers her 0.1s ana thread'de kuyruğu boşaltır
+  - Böylece Blender çökmez
+
+HARİTA MODU (v0.2):
+  - Harita için drone'un asıl kamerasına (CAMERA_NAME) hiç dokunulmuyor.
+  - Ayrı bir "Camera_map" objesi tepeden ortografik çekim yapıyor.
+  - ENTER_MAP / CAPTURE_MAP sırasında sadece scene.camera geçici olarak
+    Camera_map'e çevrilip render alınıyor, sonra drone kamerasına geri
+    dönülüyor. Drone'un konumu/rotasyonu asla değişmiyor.
+"""
+
+import bpy
+import socket
+import threading
+import base64
+import os
+import json
+import queue
+import time
+from mathutils import Vector
+
+# ─────────────────────────────────────────
+# AYARLAR — kendi objelerinin adını yaz
+# ─────────────────────────────────────────
+HOST            = "127.0.0.1"
+PORT            = 9999
+RENDER_PATH     = "/tmp/blender_frame.png"
+CAMERA_NAME     = "Camera"       # ← drone'un asıl kamerası
+CAMERA_MAP_NAME = "Camera_map"   # ← sadece harita çekimi için ayrı kamera
+# Harita sınırı hesaplanırken HARİÇ TUTULACAK collection'lar (bizim kendi objelerimiz)
+MAP_EXCLUDE_COLLECTIONS = {"Camera", "Camera_map", "blue", "red", "Sun"}
+
+# ─────────────────────────────────────────
+# GLOBAL KUYRUK
+# ─────────────────────────────────────────
+task_queue   = queue.Queue()
+result_store = {}
+result_lock  = threading.Lock()
+task_counter = [0]
+
+_map_state = {}   # ENTER_MAP ile doldurulur, EXIT_MAP ile temizlenir
+
+def next_task_id():
+    task_counter[0] += 1
+    return task_counter[0]
+
+
+# ─────────────────────────────────────────
+# BLENDER İŞLEMLERİ (ana thread'de çalışır)
+# ─────────────────────────────────────────
+
+def do_render():
+    scene = bpy.context.scene
+    scene.render.filepath = RENDER_PATH
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.resolution_x = 640
+    scene.render.resolution_y = 480
+    bpy.ops.render.render(write_still=True)
+    print("[Blender] ✅ Render tamamlandı")
+
+
+def do_move_camera(x, y, z):
+    cam = bpy.data.objects.get(CAMERA_NAME)
+    if cam:
+        cam.location.x = float(x)
+        cam.location.y = float(y)
+        cam.location.z = float(z)
+        print(f"[Blender] 📍 Kamera → ({x:.2f}, {y:.2f}, {z:.2f})")
+        return "OK"
+    print(f"[Blender] ❌ '{CAMERA_NAME}' bulunamadı!")
+    return f"ERROR:camera_not_found"
+
+
+def do_get_position():
+    cam = bpy.data.objects.get(CAMERA_NAME)
+    if cam:
+        loc = cam.location
+        return json.dumps({"x": round(loc.x,4), "y": round(loc.y,4), "z": round(loc.z,4)})
+    return json.dumps({"error": "camera_not_found"})
+
+
+def do_get_image_b64():
+    if not os.path.exists(RENDER_PATH):
+        return None
+    with open(RENDER_PATH, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+# ─────────────────────────────────────────
+# HARİTA — kendi objelerimiz hariç her şeyin sınırını oku, ortografik çek
+# ─────────────────────────────────────────
+def do_scene_bounds():
+    """Camera/Camera_map/blue/red/Sun collection'larındaki objeler HARİÇ,
+    sahnedeki tüm mesh objelerinin gerçek dünya sınırlarını okur
+    (harita = geri kalan her şey)."""
+    min_x = min_y = min_z = float('inf')
+    max_x = max_y = max_z = float('-inf')
+    found = False
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if obj.name in (CAMERA_NAME, CAMERA_MAP_NAME):
+            continue
+        obj_colls = {c.name for c in obj.users_collection}
+        if obj_colls & MAP_EXCLUDE_COLLECTIONS:
+            continue
+        found = True
+        for corner in obj.bound_box:
+            wc = obj.matrix_world @ Vector(corner)
+            min_x = min(min_x, wc.x); max_x = max(max_x, wc.x)
+            min_y = min(min_y, wc.y); max_y = max(max_y, wc.y)
+            min_z = min(min_z, wc.z); max_z = max(max_z, wc.z)
+    if not found:
+        return None
+    return {"min_x": min_x, "max_x": max_x, "min_y": min_y,
+            "max_y": max_y, "min_z": min_z, "max_z": max_z}
+
+
+def do_enter_map():
+    """Harita moduna hazırlar: sınırları hesaplar. Drone kamerasına
+    dokunulmaz — sadece Camera_map için gereken değerler saklanır."""
+    cam_map = bpy.data.objects.get(CAMERA_MAP_NAME)
+    if not cam_map:
+        return "ERROR:camera_map_not_found"
+    bounds = do_scene_bounds()
+    if bounds is None:
+        return "ERROR:no_map_objects_found"
+
+    width  = bounds["max_x"] - bounds["min_x"]
+    height = bounds["max_y"] - bounds["min_y"]
+    aspect = 480.0 / 640.0   # render_y / render_x
+    base_scale = max(width, height / aspect) * 1.15   # %15 pay
+
+    _map_state["cx"] = (bounds["min_x"] + bounds["max_x"]) / 2.0
+    _map_state["cy"] = (bounds["min_y"] + bounds["max_y"]) / 2.0
+    _map_state["max_z"] = bounds["max_z"]
+    _map_state["base_scale"] = base_scale
+
+    # Camera_map'i bir kez ortografik + nadir (yukarıdan aşağı) ayarla.
+    if cam_map.data.type != 'ORTHO':
+        cam_map.data.type = 'ORTHO'
+    cam_map.rotation_euler = (0.0, 0.0, 0.0)
+
+    print(f"[Blender] 🗺️ Harita sinirlari: X[{bounds['min_x']:.2f},{bounds['max_x']:.2f}] "
+          f"Y[{bounds['min_y']:.2f},{bounds['max_y']:.2f}]  merkez=({_map_state['cx']:.2f},{_map_state['cy']:.2f})")
+
+    return json.dumps({
+        "cx": _map_state["cx"], "cy": _map_state["cy"],
+        "base_scale": base_scale,
+        "min_x": bounds["min_x"], "max_x": bounds["max_x"],
+        "min_y": bounds["min_y"], "max_y": bounds["max_y"],
+    })
+
+
+def do_capture_map(scale_mult, offset_x, offset_y):
+    """Camera_map'i harita merkezinin üstüne konumlandırır, scene.camera'yı
+    geçici olarak ona çevirip render alır, sonra drone kamerasına geri döner."""
+    cam_map = bpy.data.objects.get(CAMERA_MAP_NAME)
+    if not cam_map or "cx" not in _map_state:
+        return None
+
+    cx = _map_state["cx"] + offset_x
+    cy = _map_state["cy"] + offset_y
+    scale = max(0.5, _map_state["base_scale"] * scale_mult)
+
+    cam_map.data.ortho_scale = scale
+    cam_map.location = (cx, cy, _map_state["max_z"] + 50.0)
+
+    scene = bpy.context.scene
+    prev_camera = scene.camera
+    scene.camera = cam_map
+    try:
+        do_render()
+        b64 = do_get_image_b64()
+    finally:
+        scene.camera = prev_camera   # drone kamerasına geri dön
+
+    return b64
+
+
+def do_exit_map():
+    """Harita durumunu temizler. Drone kamerası zaten hiç değişmediği için
+    geri yükleme yapmaya gerek yok."""
+    scene = bpy.context.scene
+    drone_cam = bpy.data.objects.get(CAMERA_NAME)
+    if drone_cam:
+        scene.camera = drone_cam
+    _map_state.clear()
+    return "OK"
+
+
+# ─────────────────────────────────────────
+# TIMER (ana thread - 100ms)
+# ─────────────────────────────────────────
+
+def process_task_queue():
+    try:
+        while not task_queue.empty():
+            task_id, cmd, args = task_queue.get_nowait()
+            result = "ERROR:unknown_cmd"
+
+            if cmd == "PING":
+                result = "PONG"
+
+            elif cmd == "RENDER_AND_GET":
+                do_render()
+                b64 = do_get_image_b64()
+                result = f"IMAGE:{b64}" if b64 else "ERROR:no_render_file"
+
+            elif cmd == "GET_POSITION":
+                result = f"POSITION:{do_get_position()}"
+
+            elif cmd == "MOVE":
+                x, y, z = args
+                result = do_move_camera(x, y, z)
+
+            elif cmd == "ENTER_MAP":
+                r = do_enter_map()
+                result = r if r.startswith("ERROR") else f"BOUNDS:{r}"
+
+            elif cmd == "CAPTURE_MAP":
+                scale_mult, ox, oy = args
+                b64 = do_capture_map(scale_mult, ox, oy)
+                result = f"IMAGE:{b64}" if b64 else "ERROR:capture_failed"
+
+            elif cmd == "EXIT_MAP":
+                result = do_exit_map()
+
+            with result_lock:
+                result_store[task_id] = result
+
+    except Exception as e:
+        print(f"[Blender Timer] Hata: {e}")
+
+    return 0.1
+
+
+# ─────────────────────────────────────────
+# SOCKET SERVER (arka plan thread)
+# ─────────────────────────────────────────
+
+def wait_for_result(task_id, timeout=120.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        with result_lock:
+            if task_id in result_store:
+                return result_store.pop(task_id)
+        time.sleep(0.05)
+    return "ERROR:timeout"
+
+
+def handle_client(conn, addr):
+    try:
+        raw = conn.recv(4096).decode("utf-8").strip()
+        if not raw:
+            return
+        print(f"[Blender] ← {raw[:80]}")
+
+        tid = next_task_id()
+
+        if raw == "PING":
+            task_queue.put((tid, "PING", None))
+
+        elif raw == "GET_IMAGE":
+            task_queue.put((tid, "RENDER_AND_GET", None))
+
+        elif raw == "GET_POSITION":
+            task_queue.put((tid, "GET_POSITION", None))
+
+        elif raw.startswith("MOVE_DRONE:"):
+            parts = raw[len("MOVE_DRONE:"):].split(",")
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            task_queue.put((tid, "MOVE", (x, y, z)))
+
+        elif raw == "ENTER_MAP":
+            task_queue.put((tid, "ENTER_MAP", None))
+
+        elif raw.startswith("CAPTURE_MAP:"):
+            parts = raw[len("CAPTURE_MAP:"):].split(",")
+            scale_mult, ox, oy = float(parts[0]), float(parts[1]), float(parts[2])
+            task_queue.put((tid, "CAPTURE_MAP", (scale_mult, ox, oy)))
+
+        elif raw == "EXIT_MAP":
+            task_queue.put((tid, "EXIT_MAP", None))
+
+        else:
+            conn.sendall(b"UNKNOWN_COMMAND\n")
+            return
+
+        result = wait_for_result(tid)
+        conn.sendall(f"{result}\n".encode("utf-8"))
+
+    except Exception as e:
+        print(f"[Blender] handle_client hata: {e}")
+        try:
+            conn.sendall(f"ERROR:{e}\n".encode("utf-8"))
+        except:
+            pass
+    finally:
+        conn.close()
+
+
+def socket_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((HOST, PORT))
+    except OSError as e:
+        print(f"[Blender] ❌ Port {PORT} kullanımda: {e}")
+        return
+    srv.listen(20)
+    print(f"[Blender] 🟢 Server açık → {HOST}:{PORT}")
+    while True:
+        try:
+            conn, addr = srv.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        except Exception as e:
+            print(f"[Blender] accept hatası: {e}")
+
+
+# ─────────────────────────────────────────
+# BAŞLAT
+# ─────────────────────────────────────────
+
+if not bpy.app.timers.is_registered(process_task_queue):
+    bpy.app.timers.register(process_task_queue, persistent=True)
+
+threading.Thread(target=socket_server, daemon=True).start()
+
+print("=" * 50)
+print("  BLENDER SERVER HAZIR")
+print(f"  Drone kamerasi : {CAMERA_NAME}")
+print(f"  Harita kamerasi: {CAMERA_MAP_NAME}")
+print(f"  Port           : {PORT}")
+print("=" * 50)
