@@ -27,6 +27,8 @@ Blender ortamı ile TCP/IP protokolü üzerinden gerçek zamanlı haberleşen, P
 
 <img width="854" height="480" alt="v0.2 Harita ve Waypoint Sistemi" src="https://github.com/user-attachments/assets/59005585-9ebc-4907-aa1c-155795582c34" />
 
+> 🟥 **Önemli Eksiklik:** Şu anki sürümde, kullanıcı tarafından manuel olarak oluşturulan rotalarda otonom görüntü işleme/hedef tanımlama özelliği çalışmamaktadır. Bu sorunun v0.3 sürümünde tamamen çözülmesi planlanmaktadır.
+
 ---
 
 ### 📍 v0.3 — Genişletilmiş Harita ve Rota Editörü
@@ -48,4 +50,3 @@ Blender ortamı ile TCP/IP protokolü üzerinden gerçek zamanlı haberleşen, P
 * **`G` Tuşu:** İHA uçuş görevini başlatır (Start).
 * **`S` Tuşu:** İHA uçuş görevini durdurur (Stop).
 
-> 🟥 **Önemli Eksiklik:** Şu anki sürümde, kullanıcı tarafından manuel olarak oluşturulan rotalarda otonom görüntü işleme/hedef tanımlama özelliği çalışmamaktadır. Bu sorunun v0.4 sürümünde tamamen çözülmesi planlanmaktadır.
