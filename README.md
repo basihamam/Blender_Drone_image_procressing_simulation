@@ -46,6 +46,9 @@ Blender ortamı ile TCP/IP protokolü üzerinden gerçek zamanlı haberleşen, P
 **Yazılım henüz son kullanıcı aşamasında (kararlı sürümde) değildir ve geliştirme ortamı tuş kombinasyonları ile kontrol edilmektedir:**
 
 * **`P` Tuşu:** Harita ekranını açar ve manuel rota noktası (waypoint) belirleme modunu aktif eder.
+* **`K` Tuşu:** tıklanınca konulan default actionu değiştirir
+* **`b` Tuşu:** dümdüz çizgiler yerine eğri çizgileri aktif eder
+* **`h` Tuşu:** görev haritasını açar
 * **`M` Tuşu:** Uçuş modunu değiştirir (İHA'nın varsayılan otonom spiral rotada mı yoksa sizin belirlediğiniz manuel rotada mı uçacağını ayarlar).
 * **`G` Tuşu:** İHA uçuş görevini başlatır (Start).
 * **`S` Tuşu:** İHA uçuş görevini durdurur (Stop).
